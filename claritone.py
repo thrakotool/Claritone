@@ -17,6 +17,7 @@ import glob
 import os
 import sys
 import re
+import copy
 
 # ── Organized directory layout ────────────────────────────────────────
 # Everything lives next to the script:
@@ -33,6 +34,7 @@ import re
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, List
+from functools import lru_cache
 import numpy as np
 import soundfile as sf
 import math
@@ -167,6 +169,45 @@ def to_cpu(arr) -> np.ndarray:
         if isinstance(arr, torch.Tensor):
             return arr.cpu().numpy()
     return np.asarray(arr)
+
+
+def _is_torch_oom_error(exc: Exception) -> bool:
+    """Return True if an exception looks like a CUDA OOM condition."""
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda error: out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+    )
+
+
+def _clear_torch_cuda_cache() -> None:
+    """Best-effort cleanup after CUDA allocation failures."""
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _run_with_cpu_backend_fallback(fn, *args, **kwargs):
+    """Run callable and retry once with CPU backend if GPU OOM/memory error occurs."""
+    global BACKEND
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        if not (_is_torch_oom_error(e) or "memory" in str(e).lower()):
+            raise
+        prev_backend = BACKEND
+        print("  ⚠️  GPU memory limit reached; retrying this stage on CPU backend")
+        _clear_torch_cuda_cache()
+        try:
+            BACKEND = "cpu"
+            return fn(*args, **kwargs)
+        finally:
+            BACKEND = prev_backend
 
 
 # =========================
@@ -556,13 +597,14 @@ def gpu_irfft(x, n=None, axis=-1):
 # =========================
 
 class GPUStft:
-    """GPU-accelerated Short-Time Fourier Transform"""
+    """GPU-accelerated Short-Time Fourier Transform."""
     
-    def __init__(self, n_fft: int = 2048, hop_length: int = 512, 
-                 window: str = 'hann'):
+    def __init__(self, n_fft: int = 2048, hop_length: int = 512,
+                 window: str = 'hann', max_frames_per_batch: int = 512):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.window_type = window
+        self.max_frames_per_batch = max(32, int(max_frames_per_batch))
         self.window = signal.get_window(window, n_fft).astype(np.float64)
         
         if BACKEND == "cupy" and cp is not None:
@@ -593,26 +635,39 @@ class GPUStft:
     def _stft_cupy(self, x: np.ndarray) -> np.ndarray:
         x_gpu = cp.asarray(x)
         n_frames = 1 + (len(x) - self.n_fft) // self.hop_length
-        
-        # Create frame matrix on GPU
-        indices = cp.arange(self.n_fft)[None, :] + cp.arange(n_frames)[:, None] * self.hop_length
-        frames = x_gpu[indices] * self.window_gpu
-        
-        # FFT on GPU
-        X = cp.fft.rfft(frames, axis=1).T
-        return cp.asnumpy(X)
+        n_bins = self.n_fft // 2 + 1
+
+        # Batched STFT to prevent OOM on long files.
+        X_out = np.empty((n_bins, n_frames), dtype=np.complex128)
+        batch = self.max_frames_per_batch
+
+        for start in range(0, n_frames, batch):
+            end = min(n_frames, start + batch)
+            frame_ids = cp.arange(start, end)[:, None]
+            indices = cp.arange(self.n_fft)[None, :] + frame_ids * self.hop_length
+            frames = x_gpu[indices] * self.window_gpu
+            Xb = cp.fft.rfft(frames, axis=1).T
+            X_out[:, start:end] = cp.asnumpy(Xb)
+
+        return X_out
     
     def _stft_torch(self, x: np.ndarray) -> np.ndarray:
         x_gpu = torch.from_numpy(np.ascontiguousarray(x)).cuda()
-        X = torch.stft(
-            x_gpu, 
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.n_fft,
-            window=self.window_gpu,
-            return_complex=True
-        )
-        return X.cpu().numpy()
+        try:
+            X = torch.stft(
+                x_gpu,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.n_fft,
+                window=self.window_gpu,
+                return_complex=True
+            )
+            return X.cpu().numpy()
+        except Exception as e:
+            if _is_torch_oom_error(e):
+                _clear_torch_cuda_cache()
+                return self._stft_cpu(np.asarray(x))
+            raise
     
     def _stft_cpu(self, x: np.ndarray) -> np.ndarray:
         if LIBROSA_AVAILABLE:
@@ -630,42 +685,52 @@ class GPUStft:
     def _istft_cupy(self, X: np.ndarray, length: Optional[int]) -> np.ndarray:
         X_gpu = cp.asarray(X)
         n_frames = X.shape[1]
-        
+
         if length is None:
             length = (n_frames - 1) * self.hop_length + self.n_fft
-        
-        # IFFT on GPU
-        frames = cp.fft.irfft(X_gpu.T, n=self.n_fft, axis=1)
-        frames = frames * self.window_gpu
-        
-        # Overlap-add on GPU
+
+        # Batched overlap-add to keep peak VRAM bounded.
         output = cp.zeros(length, dtype=cp.float64)
         window_sum = cp.zeros(length, dtype=cp.float64)
-        
-        for i in range(n_frames):
-            start = i * self.hop_length
-            end = min(start + self.n_fft, length)
-            frame_len = end - start
-            output[start:end] += frames[i, :frame_len]
-            window_sum[start:end] += self.window_gpu[:frame_len] ** 2
-        
+        win_sq = self.window_gpu ** 2
+        batch = self.max_frames_per_batch
+
+        for start_frame in range(0, n_frames, batch):
+            end_frame = min(n_frames, start_frame + batch)
+            frames = cp.fft.irfft(X_gpu[:, start_frame:end_frame].T, n=self.n_fft, axis=1)
+            frames = frames * self.window_gpu
+
+            for bi in range(end_frame - start_frame):
+                i = start_frame + bi
+                start = i * self.hop_length
+                end = min(start + self.n_fft, length)
+                frame_len = end - start
+                output[start:end] += frames[bi, :frame_len]
+                window_sum[start:end] += win_sq[:frame_len]
+
         # Normalize
         window_sum = cp.maximum(window_sum, 1e-8)
         output = output / window_sum
-        
+
         return cp.asnumpy(output)
     
     def _istft_torch(self, X: np.ndarray, length: Optional[int]) -> np.ndarray:
         X_gpu = torch.from_numpy(np.ascontiguousarray(X)).cuda()
-        result = torch.istft(
-            X_gpu,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.n_fft,
-            window=self.window_gpu,
-            length=length
-        )
-        return result.cpu().numpy()
+        try:
+            result = torch.istft(
+                X_gpu,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.n_fft,
+                window=self.window_gpu,
+                length=length
+            )
+            return result.cpu().numpy()
+        except Exception as e:
+            if _is_torch_oom_error(e):
+                _clear_torch_cuda_cache()
+                return self._istft_cpu(np.asarray(X), length)
+            raise
     
     def _istft_cpu(self, X: np.ndarray, length: Optional[int]) -> np.ndarray:
         if LIBROSA_AVAILABLE:
@@ -691,6 +756,14 @@ class GPUStft:
             return output / window_sum
 
 
+@lru_cache(maxsize=16)
+def _get_stft_engine(n_fft: int, hop_length: int, window: str = 'hann', max_frames_per_batch: int = 512) -> GPUStft:
+    """Cache STFT engines to avoid repeated window/device allocations."""
+    return GPUStft(n_fft=n_fft, hop_length=hop_length, window=window,
+                   max_frames_per_batch=max_frames_per_batch)
+
+
+
 # =========================
 # Configuration
 # =========================
@@ -704,6 +777,9 @@ class UltimateGPUConfig:
     DSRE_PRE_HP = 5000.0           # Only touch content above 5kHz
     DSRE_POST_HP = 15000.0         # Only keep DSRE output above 14kHz (fills gap)
     DSRE_FILTER_ORDER = 4          # Very gentle slope
+    DSRE_CHUNKED_FALLBACK = True   # On OOM, process DSRE in overlap-add chunks
+    DSRE_CHUNK_SECONDS = 18.0
+    DSRE_CHUNK_OVERLAP_SECONDS = 2.0
     
     # =========================================================================
     # ANALOG VITALITY — replaces HFR
@@ -774,6 +850,9 @@ class UltimateGPUConfig:
     DECLIP_ITERATIONS = 500
     DECLIP_LAMBDA = 0.08
     DECLIP_MULTI_RESOLUTION = True
+    DECLIP_EARLY_STOP = True
+    DECLIP_EARLY_STOP_DELTA = 1e-5
+    DECLIP_EARLY_STOP_PATIENCE = 5
     
     # Processing
     NUM_ENHANCEMENT_PASSES = 1
@@ -855,6 +934,10 @@ class UltimateGPUConfig:
     # htdemucs_ft (fine-tuned) is slower but often cleaner than htdemucs.
     # Falls back to htdemucs if ft is unavailable.
     DEMUCS_MODEL_NAME = "htdemucs_ft"  # "htdemucs_ft" or "htdemucs"
+    # Memory safety controls (important on 8 GB GPUs and very long tracks)
+    DEMUCS_FORCE_MANUAL_CHUNKING = False
+    DEMUCS_CHUNK_SECONDS = 20.0
+    DEMUCS_OVERLAP_SECONDS = 3.0
 
 
 # =========================
@@ -868,6 +951,9 @@ class GPUDeclipper:
         self.config = config
         self.iterations = config.DECLIP_ITERATIONS
         self.lambda_reg = config.DECLIP_LAMBDA
+        self.early_stop = bool(getattr(config, 'DECLIP_EARLY_STOP', True))
+        self.early_stop_delta = float(getattr(config, 'DECLIP_EARLY_STOP_DELTA', 1e-5))
+        self.early_stop_patience = int(getattr(config, 'DECLIP_EARLY_STOP_PATIENCE', 5))
     
     def declip(self, audio: np.ndarray, sr: int,
                clipping_threshold: Optional[float] = None) -> np.ndarray:
@@ -902,7 +988,7 @@ class GPUDeclipper:
         # Initialize
         frame_length = 2048
         hop_length = 512
-        stft_engine = GPUStft(n_fft=frame_length, hop_length=hop_length)
+        stft_engine = _get_stft_engine(n_fft=frame_length, hop_length=hop_length)
         
         x_rec = audio.copy()
         
@@ -913,6 +999,9 @@ class GPUDeclipper:
             low_gpu = cp.asarray(clipped_low)
             audio_gpu = cp.asarray(audio)
         
+        no_improve = 0
+        prev_rec = x_rec.copy()
+
         for iteration in range(self.iterations):
             # Apply consistency constraint
             if BACKEND == "cupy" and cp is not None:
@@ -947,6 +1036,18 @@ class GPUDeclipper:
             
             # ISTFT on GPU
             x_rec = stft_engine.istft(D_sparse, length=len(audio))
+
+            if self.early_stop:
+                denom = np.linalg.norm(prev_rec) + 1e-12
+                delta = np.linalg.norm(x_rec - prev_rec) / denom
+                if delta < self.early_stop_delta:
+                    no_improve += 1
+                else:
+                    no_improve = 0
+                prev_rec = x_rec.copy()
+                if no_improve >= self.early_stop_patience:
+                    print(f"        Early stop at iter {iteration + 1} (delta={delta:.2e})")
+                    break
             
             if (iteration + 1) % 100 == 0:
                 print(f"        Iteration {iteration + 1}/{self.iterations}")
@@ -1097,6 +1198,73 @@ def zansei_gpu(
     return result[0] if is_mono else result
 
 
+def zansei_chunked_gpu(
+    x: np.ndarray,
+    sr: int,
+    m: int = 16,
+    decay: float = 1.15,
+    pre_hp: float = 2500.0,
+    post_hp: float = 14000.0,
+    filter_order: int = 15,
+    num_passes: int = 2,
+    pass_decay: float = 0.7,
+    chunk_seconds: float = 20.0,
+    overlap_seconds: float = 2.0,
+) -> np.ndarray:
+    """Memory-bounded DSRE via overlap-add chunking for long files."""
+    is_mono = x.ndim == 1
+    if is_mono:
+        x = x[np.newaxis, :]
+
+    channels, n_samples = x.shape
+    chunk_len = int(max(2.0, chunk_seconds) * sr)
+    overlap = int(max(0.0, overlap_seconds) * sr)
+    overlap = min(overlap, max(0, chunk_len // 2 - 1))
+    hop = max(1, chunk_len - overlap)
+
+    out = np.zeros((channels, n_samples), dtype=np.float64)
+    wsum = np.zeros((n_samples,), dtype=np.float64)
+
+    starts = list(range(0, max(1, n_samples), hop))
+    if starts and starts[-1] + chunk_len < n_samples:
+        starts.append(max(0, n_samples - chunk_len))
+
+    fade = np.hanning(max(2, overlap * 2)).astype(np.float64) if overlap > 0 else None
+    fade_in = fade[:overlap] if fade is not None else None
+    fade_out = fade[-overlap:] if fade is not None else None
+
+    for s0 in starts:
+        e0 = min(n_samples, s0 + chunk_len)
+        seg = x[:, s0:e0]
+        seg_len = e0 - s0
+
+        seg_out = zansei_gpu(
+            seg,
+            sr,
+            m=m,
+            decay=decay,
+            pre_hp=pre_hp,
+            post_hp=post_hp,
+            filter_order=filter_order,
+            num_passes=num_passes,
+            pass_decay=pass_decay,
+        )
+
+        w = np.ones((seg_len,), dtype=np.float64)
+        if overlap > 0 and s0 > 0:
+            nfi = min(overlap, seg_len)
+            w[:nfi] *= fade_in[:nfi]
+        if overlap > 0 and e0 < n_samples:
+            nfo = min(overlap, seg_len)
+            w[-nfo:] *= fade_out[-nfo:]
+
+        out[:, s0:e0] += seg_out * w[None, :]
+        wsum[s0:e0] += w
+
+    out /= np.maximum(wsum[None, :], 1e-12)
+    return out[0] if is_mono else out
+
+
 def _zansei_single_pass_gpu(
     x: np.ndarray,
     sr: int,
@@ -1141,7 +1309,7 @@ def _zansei_single_pass_gpu(
     try:
         _dsre_nfft = 2048
         _dsre_hop = 512
-        _dsre_stft = GPUStft(n_fft=_dsre_nfft, hop_length=_dsre_hop)
+        _dsre_stft = _get_stft_engine(n_fft=_dsre_nfft, hop_length=_dsre_hop)
         for _dch in range(channels):
             _S_d = _dsre_stft.stft(d_res[_dch].astype(np.float64))
             _mag_d = np.abs(_S_d)
@@ -1212,7 +1380,7 @@ def _smooth_highpass_crossfade(audio: np.ndarray, sr: int, cutoff_hz: float,
 
     n_fft = 2048
     hop_length = 512
-    stft_engine = GPUStft(n_fft=n_fft, hop_length=hop_length)
+    stft_engine = _get_stft_engine(n_fft=n_fft, hop_length=hop_length)
 
     result = np.zeros_like(audio)
 
@@ -1268,7 +1436,7 @@ class GPUGriffinLim:
         self.hop_length = hop_length
         self.n_iter = n_iter
         self.momentum = momentum
-        self.stft_engine = GPUStft(n_fft=n_fft, hop_length=hop_length)
+        self.stft_engine = _get_stft_engine(n_fft=n_fft, hop_length=hop_length)
     
     def reconstruct(self, magnitude: np.ndarray, 
                     length: Optional[int] = None) -> np.ndarray:
@@ -2912,7 +3080,12 @@ class ParameterTuner:
     @staticmethod
     def analyze(audio: np.ndarray, sr: int) -> dict:
         """Analyze audio characteristics with robust bandwidth detection"""
-        audio_mono = audio.flatten() if audio.ndim == 2 else audio
+        # Use a true channel downmix for analysis (not interleaved flatten),
+        # so PSD/bandwidth estimates remain physically meaningful on stereo input.
+        if audio.ndim == 2:
+            audio_mono = np.mean(audio, axis=1)
+        else:
+            audio_mono = audio
         
         results = {
             'sample_rate': sr,
@@ -4180,7 +4353,7 @@ def _hf_seam_boost(audio: np.ndarray, sr: int,
 
     n_fft = 4096
     hop = 1024
-    stft_engine = GPUStft(n_fft=n_fft, hop_length=hop)
+    stft_engine = _get_stft_engine(n_fft=n_fft, hop_length=hop)
     eps = 1e-10
 
     num_bins = n_fft // 2 + 1
@@ -4329,7 +4502,7 @@ def _dynamic_seam_bridge(audio: np.ndarray, sr: int, cfg) -> np.ndarray:
     # STFT params — 4096 gives ~11.7 Hz/bin resolution at 48 kHz
     n_fft = 4096
     hop   = 1024
-    stft_engine = GPUStft(n_fft=n_fft, hop_length=hop)
+    stft_engine = _get_stft_engine(n_fft=n_fft, hop_length=hop)
     eps = 1e-10
 
     num_bins = n_fft // 2 + 1
@@ -5600,22 +5773,41 @@ def _run_demucs_stem_fix(audio: np.ndarray, sr: int, cfg: UltimateGPUConfig) -> 
     # ── Run separation ───────────────────────────────────────────────
     # If demucs.apply.apply_model is available, use it (handles chunking
     # and overlap internally with shifts for better quality).
-    if _demucs_apply is not None:
+    if _demucs_apply is not None and not bool(getattr(cfg, "DEMUCS_FORCE_MANUAL_CHUNKING", False)):
         try:
+            use_amp = bool(getattr(cfg, "USE_MIXED_PRECISION", False)) and device.type == "cuda"
             with torch.no_grad():
-                # apply_model returns (batch, sources, channels, time)
-                # shifts=1 for speed, overlap=0.25 for quality
-                est = _demucs_apply(model, wf, shifts=1, overlap=0.25,
-                                    device=device, progress=False)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    # apply_model returns (batch, sources, channels, time)
+                    # shifts=1 for speed, overlap=0.25 for quality
+                    est = _demucs_apply(model, wf, shifts=1, overlap=0.25,
+                                        device=device, progress=False)
             out = est[0]  # (sources, C, T)
         except Exception as e:
-            print(f"    ⚠️  demucs apply_model failed ({e}); falling back to manual chunking")
+            if _is_torch_oom_error(e):
+                print("    ⚠️  demucs apply_model hit CUDA OOM; switching to memory-safe chunked mode")
+                _clear_torch_cuda_cache()
+            else:
+                print(f"    ⚠️  demucs apply_model failed ({e}); falling back to manual chunking")
             _demucs_apply = None
 
     # Manual chunked overlap-add (fallback / torchaudio models)
     if _demucs_apply is None:
         chunk_sec = float(getattr(cfg, "DEMUCS_CHUNK_SECONDS", 20.0))
         overlap_sec = float(getattr(cfg, "DEMUCS_OVERLAP_SECONDS", 3.0))
+
+        # VRAM-aware defaults for long files on small GPUs.
+        try:
+            duration_s = float(T) / float(model_sr)
+            if torch.cuda.is_available() and duration_s > 180.0:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if vram_gb <= 8.5:
+                    chunk_sec = min(chunk_sec, 8.0)
+                    overlap_sec = min(overlap_sec, 1.5)
+                    print(f"    ℹ️  Long file + {vram_gb:.1f} GB VRAM: using safer Demucs chunks ({chunk_sec:.1f}s)")
+        except Exception:
+            pass
+
         chunk_sec = max(5.0, min(chunk_sec, 60.0))
         overlap_sec = max(0.0, min(overlap_sec, chunk_sec * 0.49))
 
@@ -5633,8 +5825,10 @@ def _run_demucs_stem_fix(audio: np.ndarray, sr: int, cfg: UltimateGPUConfig) -> 
         fade_out = torch.flip(fade_in, dims=[0])
 
         n_src = len(labels)
-        out = torch.zeros((n_src, wf.shape[1], T), device=device, dtype=torch.float32)
-        wsum = torch.zeros((T,), device=device, dtype=torch.float32)
+        # Keep overlap-add accumulators on CPU so memory use does not scale with
+        # track length on GPU. This is slower but robust for very long files.
+        out = np.zeros((n_src, wf.shape[1], T), dtype=np.float32)
+        wsum = np.zeros((T,), dtype=np.float32)
 
         starts = list(range(0, max(1, T), hop))
         if starts and starts[-1] + chunk_len < T:
@@ -5648,25 +5842,40 @@ def _run_demucs_stem_fix(audio: np.ndarray, sr: int, cfg: UltimateGPUConfig) -> 
                 if pad > 0:
                     seg = torch.nn.functional.pad(seg, (0, pad))
 
-                est = model(seg)[0]  # (sources, C, chunk_len)
-                est = est[:, :, : (e - s)]
+                try:
+                    use_amp = bool(getattr(cfg, "USE_MIXED_PRECISION", False)) and device.type == "cuda"
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        est = model(seg)[0]  # (sources, C, chunk_len)
+                except Exception as e_oom:
+                    if _is_torch_oom_error(e_oom):
+                        _clear_torch_cuda_cache()
+                        raise RuntimeError(
+                            "Demucs chunk inference OOM. Reduce --demucs-chunk-seconds "
+                            "or disable stems for this file."
+                        ) from e_oom
+                    raise
 
-                w = torch.ones((e - s,), device=device)
+                est = est[:, :, : (e - s)].detach().cpu().numpy()
+
+                w = np.ones((e - s,), dtype=np.float32)
                 if s > 0 and overlap > 0:
                     nfi = min(overlap, e - s)
-                    w[:nfi] *= fade_in[:nfi]
+                    w[:nfi] *= fade_in[:nfi].detach().cpu().numpy()
                 if e < T and overlap > 0:
                     nfo = min(overlap, e - s)
-                    w[-nfo:] *= fade_out[-nfo:]
+                    w[-nfo:] *= fade_out[-nfo:].detach().cpu().numpy()
 
                 out[:, :, s:e] += est * w[None, None, :]
                 wsum[s:e] += w
 
-        wsum = torch.clamp(wsum, min=1e-6)
+        wsum = np.maximum(wsum, 1e-6)
         out = out / wsum[None, None, :]
 
     # ── Recombine stems with per-stem processing ─────────────────────
-    stems = {lab: out[i].detach().cpu().numpy().T for i, lab in enumerate(labels)}
+    if isinstance(out, np.ndarray):
+        stems = {lab: out[i].T for i, lab in enumerate(labels)}
+    else:
+        stems = {lab: out[i].detach().cpu().numpy().T for i, lab in enumerate(labels)}
 
     drums = stems.get("drums")
     bass = stems.get("bass")
@@ -5875,7 +6084,8 @@ def process_file_gpu(
 
     if getattr(config, 'ENABLE_SPECTRAL_FLUX_CORRECTION', True):
         print("  Spectral flux correction...")
-        audio = _spectral_flux_correction(
+        audio = _run_with_cpu_backend_fallback(
+            _spectral_flux_correction,
             audio, sr,
             strength=float(getattr(config, 'SPECTRAL_FLUX_STRENGTH', 0.65)),
             flux_threshold=float(getattr(config, 'SPECTRAL_FLUX_THRESHOLD', 0.30)),
@@ -5885,19 +6095,40 @@ def process_file_gpu(
     else:
         print("  ⏭  Spectral flux correction skipped")
 
-    # ─── [12] DSRE — conservative detail recovery ────────────────────
+    # ─── [11] DSRE — conservative detail recovery ────────────────────
     if enable_dsre:
         print(f"\n[11/{TOTAL_STAGES}] GPU DSRE ({config.DSRE_M} stages, gentle)")
         pre_dsre_peak = np.max(np.abs(audio))
-        audio = zansei_gpu(
-            audio.T, sr,
-            m=config.DSRE_M,
-            decay=config.DSRE_DECAY,
-            pre_hp=config.DSRE_PRE_HP,
-            post_hp=config.DSRE_POST_HP,
-            filter_order=config.DSRE_FILTER_ORDER,
-            num_passes=config.NUM_ENHANCEMENT_PASSES,
-        ).T
+        try:
+            audio = zansei_gpu(
+                audio.T, sr,
+                m=config.DSRE_M,
+                decay=config.DSRE_DECAY,
+                pre_hp=config.DSRE_PRE_HP,
+                post_hp=config.DSRE_POST_HP,
+                filter_order=config.DSRE_FILTER_ORDER,
+                num_passes=config.NUM_ENHANCEMENT_PASSES,
+            ).T
+        except Exception as e:
+            if _is_torch_oom_error(e) or "memory" in str(e).lower():
+                print("  ⚠️  DSRE hit memory limits; retrying with chunked DSRE fallback")
+                _clear_torch_cuda_cache()
+                if bool(getattr(config, 'DSRE_CHUNKED_FALLBACK', True)):
+                    audio = zansei_chunked_gpu(
+                        audio.T, sr,
+                        m=config.DSRE_M,
+                        decay=config.DSRE_DECAY,
+                        pre_hp=config.DSRE_PRE_HP,
+                        post_hp=config.DSRE_POST_HP,
+                        filter_order=config.DSRE_FILTER_ORDER,
+                        num_passes=config.NUM_ENHANCEMENT_PASSES,
+                        chunk_seconds=float(getattr(config, 'DSRE_CHUNK_SECONDS', 18.0)),
+                        overlap_seconds=float(getattr(config, 'DSRE_CHUNK_OVERLAP_SECONDS', 2.0)),
+                    ).T
+                else:
+                    raise
+            else:
+                raise
         post_dsre_peak = np.max(np.abs(audio))
         print(f"  ✓ DSRE complete, peak: {pre_dsre_peak:.4f} -> {post_dsre_peak:.4f}")
         if post_dsre_peak > target_peak:
@@ -5911,11 +6142,11 @@ def process_file_gpu(
     # HF seam bridge
     if getattr(config, 'DYNAMIC_SEAM_BRIDGE', False) and getattr(config, 'DYNAMIC_SEAM_DB', 0) > 0.1:
         print(f"  Applying dynamic seam bridge (+{config.DYNAMIC_SEAM_DB:.1f} dB, Q={config.DYNAMIC_SEAM_Q:.0f}, energy-following)...")
-        audio = _dynamic_seam_bridge(audio, sr, config)
+        audio = _run_with_cpu_backend_fallback(_dynamic_seam_bridge, audio, sr, config)
         audio = normalize_peak(audio, target_peak)
     elif config.SEAM_BOOST_DB > 0.1:
         print(f"  Applying static seam boost (+{config.SEAM_BOOST_DB:.1f} dB, -{config.SEAM_BOOST_ROLLOFF:.1f} dB/oct)...")
-        audio = _hf_seam_boost(audio, sr,
+        audio = _run_with_cpu_backend_fallback(_hf_seam_boost, audio, sr,
                                seam_hz=float(config.SEAM_BOOST_HZ),
                                peak_boost_db=config.SEAM_BOOST_DB,
                                rolloff_db_per_oct=config.SEAM_BOOST_ROLLOFF,
@@ -5924,14 +6155,14 @@ def process_file_gpu(
 
     # HF naturalization
     print(f"  Naturalizing HF spectrum (frequency-proportional)...")
-    audio = _hf_naturalize(audio, sr,
+    audio = _run_with_cpu_backend_fallback(_hf_naturalize, audio, sr,
                            transition_hz=config.NATURALIZE_TRANSITION_HZ,
                            diffusion_strength=config.NATURALIZE_DIFFUSION,
                            noise_floor_db=config.NATURALIZE_NOISE_FLOOR_DB,
                            phase_diffusion_amount=config.NATURALIZE_PHASE_DIFFUSION)
 
     # Ultrasonic cleanup
-    audio = _ultrasonic_cleanup(audio, sr, cutoff_hz=20500.0)
+    audio = _run_with_cpu_backend_fallback(_ultrasonic_cleanup, audio, sr, cutoff_hz=20500.0)
 
     # Envelope matching from reference (prevent loud/quiet drift)
     audio = _preserve_envelope_down_only(audio, ref_audio, sr)
@@ -5986,6 +6217,8 @@ def main():
     parser.add_argument("-o", "--output-dir", default=None,
                         help="Output directory (default: ./output/ next to script)")
     parser.add_argument("--sr", type=int, default=0, help="Target sample rate")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel file workers (default: 1)")
     
     # Stages on/off
     parser.add_argument("--no-apollo", action="store_true", help="Disable Apollo restore")
@@ -6027,6 +6260,12 @@ def main():
     parser.add_argument("--demucs-model", type=str, default=None,
                         choices=["htdemucs_ft", "htdemucs", "htdemucs_6s"],
                         help="Demucs model (default: htdemucs_ft)")
+    parser.add_argument("--demucs-chunk-seconds", type=float, default=None,
+                        help="Demucs manual chunk size in seconds (memory/speed tradeoff)")
+    parser.add_argument("--demucs-overlap-seconds", type=float, default=None,
+                        help="Demucs manual overlap in seconds")
+    parser.add_argument("--demucs-force-manual", action="store_true",
+                        help="Force memory-safe manual Demucs chunking (skip apply_model)")
 
     # Vitality tuning (all have sane defaults in config)
     parser.add_argument("--saturation", type=float, default=None,
@@ -6047,9 +6286,17 @@ def main():
                         help="Transient strength 0..1 (default 0.10 — very gentle)")
     parser.add_argument("--roughness", type=float, default=None)
     parser.add_argument("--truepeak", type=float, default=-1.0)
+    parser.add_argument("--mixed-precision", action="store_true",
+                        help="Use torch autocast in supported model stages for speed/VRAM")
     parser.add_argument("--gl-iterations", type=int, default=150)
     parser.add_argument("--declip-iterations", type=int, default=500)
     parser.add_argument("--dsre-m", type=int, default=None)
+    parser.add_argument("--dsre-chunk-seconds", type=float, default=None,
+                        help="Chunk size for DSRE fallback (seconds)")
+    parser.add_argument("--dsre-chunk-overlap", type=float, default=None,
+                        help="Overlap for DSRE fallback chunks (seconds)")
+    parser.add_argument("--no-dsre-chunk-fallback", action="store_true",
+                        help="Disable memory-safe chunked DSRE fallback")
 
     # HF Naturalization
     parser.add_argument("--nat-transition", type=float, default=None,
@@ -6088,6 +6335,7 @@ def main():
     config.DECLIP_ITERATIONS = args.declip_iterations
     config.HFR_CUTOFF_HZ = int(args.hfr_cutoff)
     config.TRUEPEAK_TARGET_DBFS = float(args.truepeak)
+    config.USE_MIXED_PRECISION = bool(args.mixed_precision)
 
     # Apollo
     config.ENABLE_APOLLO = not args.no_apollo
@@ -6127,6 +6375,12 @@ def main():
     # Demucs model selection
     if args.demucs_model is not None:
         config.DEMUCS_MODEL_NAME = args.demucs_model
+    if args.demucs_chunk_seconds is not None:
+        config.DEMUCS_CHUNK_SECONDS = float(args.demucs_chunk_seconds)
+    if args.demucs_overlap_seconds is not None:
+        config.DEMUCS_OVERLAP_SECONDS = float(args.demucs_overlap_seconds)
+    if args.demucs_force_manual:
+        config.DEMUCS_FORCE_MANUAL_CHUNKING = True
 
     # Override vitality params if specified
     if args.saturation is not None:
@@ -6145,6 +6399,12 @@ def main():
         config.ROUGHNESS_REDUCTION = float(args.roughness)
     if args.dsre_m is not None:
         config.DSRE_M = int(args.dsre_m)
+    if args.dsre_chunk_seconds is not None:
+        config.DSRE_CHUNK_SECONDS = float(args.dsre_chunk_seconds)
+    if args.dsre_chunk_overlap is not None:
+        config.DSRE_CHUNK_OVERLAP_SECONDS = float(args.dsre_chunk_overlap)
+    if args.no_dsre_chunk_fallback:
+        config.DSRE_CHUNKED_FALLBACK = False
     if args.nat_transition is not None:
         config.NATURALIZE_TRANSITION_HZ = float(args.nat_transition)
     if args.nat_diffusion is not None:
@@ -6190,20 +6450,34 @@ def main():
     print(f"   Output:  {output_dir}")
     print()
     
+    valid_inputs = []
     for input_path in args.inputs:
         if not os.path.isfile(input_path):
             print(f"❌ Skipping: {input_path}")
             continue
-        
+        valid_inputs.append(input_path)
+
+    workers = max(1, int(args.workers))
+
+    def _process_one(path: str):
+        local_cfg = copy.deepcopy(config)
         process_file_gpu(
-            input_path=input_path,
+            input_path=path,
             output_dir=output_dir,
             target_sr=target_sr,
             enable_hfr=not args.no_hfr,
             enable_dsre=not args.no_dsre,
             enable_declipping=not args.no_declipping,
-            config=config,
+            config=local_cfg,
         )
+
+    if workers == 1 or len(valid_inputs) <= 1:
+        for input_path in valid_inputs:
+            _process_one(input_path)
+    else:
+        print(f"🚀 Parallel processing enabled: {workers} workers")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_process_one, valid_inputs))
 
 
 if __name__ == "__main__":
